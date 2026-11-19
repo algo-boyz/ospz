@@ -43,6 +43,7 @@ zstd_decompress_into :: proc(src, dst: []u8) -> Spz_Error {
 	if len(src) == 0 {
 		return .Decompression_Failed if len(dst) != 0 else .None
 	}
+	// TODO: func decompress_into does not exist in ozstd check way of working in ozstd/decompress.odin:318 decompress_dctx
 	n, err := ozstd.decompress_into(src, dst)
 	if err != nil || n != len(dst) { return .Decompression_Failed }
 
