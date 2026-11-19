@@ -3,18 +3,12 @@ package ospz
 import "core:math"
 import "core:mem"
 
-// -----------------------------------------------------------------------------
 // Constants
-// -----------------------------------------------------------------------------
-
 COLOR_SCALE :: f32(0.15)
 SQRT_1_2    :: f32(0.707106781186547524401)
 
 
-// -----------------------------------------------------------------------------
 // Spherical Harmonics
-// -----------------------------------------------------------------------------
-
 dim_for_degree :: proc(degree: i32) -> i32 {
     switch degree {
     case 0: return 0
@@ -65,9 +59,7 @@ inv_sigmoid :: proc(x: f32) -> f32 {
 }
 
 
-// -----------------------------------------------------------------------------
 // Quaternion Decoding
-// -----------------------------------------------------------------------------
 
 // Decode a quaternion stored as its first three components in 8-bit
 // fixed-point representation.
@@ -93,11 +85,11 @@ unpack_quaternion_first_three :: proc(
     }
 
     xyz = {
-        (xyz[0] / 127.5 - 1.0) * c.flip_q[0],
-        (xyz[1] / 127.5 - 1.0) * c.flip_q[1],
-        (xyz[2] / 127.5 - 1.0) * c.flip_q[2],
+        xyz[0] / 127.5 - 1.0,
+        xyz[1] / 127.5 - 1.0,
+        xyz[2] / 127.5 - 1.0,
     }
-
+    
     rotation[0] = xyz[0]
     rotation[1] = xyz[1]
     rotation[2] = xyz[2]
@@ -156,19 +148,12 @@ unpack_quaternion_smallest_three :: proc(
     // Reconstruct the largest component.
     rotation[i_largest] = math.sqrt(1.0 - sum_squares)
 
-    // Within-family coordinate conversion.
-    for i in 0..<3 {
-        rotation[i] *= c.flip_q[i]
-    }
-
-    // Cross-family coordinate conversion.
+    // Coordinate conversion (within-family or cross-family).
     convert_quaternion_xyzw(c^, rotation[:])
 }
 
 
-// -----------------------------------------------------------------------------
 // Packed Gaussian Attribute Access
-// -----------------------------------------------------------------------------
 
 // Access a Packed_Gaussians attribute buffer by enum tag.
 //
