@@ -1,0 +1,190 @@
+# OSPZ
+
+`.spz` is a file format for compressed 3D gaussian splats. This directory contains a Odin library
+for saving and loading data in the .spz format.
+
+spz encoded splats are typically 10x smaller than .ply files with minimal visual difference between them.
+
+## Coordinate System
+
+By default, SPZ stores data in an RUB coordinate system following the OpenGL and three.js
+convention. This can be overridden via the `SPZ_ADOBE_coordinate_system` extension, which allows
+data to be stored in any named coordinate system (see [extensions/README.md](extensions/README.md)). This differs from other data formats such as PLY (which typically uses RDF), GLB (which
+typically uses LUF), or Unity (which typically uses RUF). To aid with coordinate system conversions,
+callers should specify the coordinate system their Gaussian Cloud data is represented in when saving
+and what coordinate system their rendering system uses when loading. These are specified in the
+PackOptions and UnpackOptions respectively.  If the coordinate system is `UNSPECIFIED`, data will
+be saved and loaded without conversion, which may harm interoperability.
+
+There are 16 named coordinate systems organised in two families:
+
+- **Standard family** — letters denote the X, Y, Z axis directions (e.g. `RUB` = Right, Up, Back):
+  `LDB`, `RDB`, `LUB`, `RUB`, `LDF`, `RDF`, `LUF`, `RUF`
+- **Rotated family** — axes are permuted by a 90-degree rotation about X (Y and Z are swapped):
+  `LFD`, `RFD`, `LFU`, `RFU`, `LBD`, `RBD`, `LBU`, `RBU`
+
+Converting between families applies a 90-degree rotation about the X axis in addition to any axis
+flips, which also rotates spherical-harmonics coefficients via the appropriate Wigner matrix.
+
+## File Format
+
+OSPZ uses ZSTD compression with a 32-byte plaintext header. Each attribute stream is compressed independently and in parallel, improving both compression and decompression throughput. Files from versions 1–3 (gzip-compressed single-stream format) can still be read. There is no maximum point count enforced during loading.
+
+### File layout (version 4)
+
+```
+Bytes  0–31:              NgspFileHeader (32 bytes, plaintext)
+Bytes  32..(tbo-1):       Extension ILV records, if flags & 0x2  (variable)
+Bytes  tbo..(tbo+N*16-1): TOC — N × [compressedSize u64, uncompressedSize u64]
+Bytes  (tbo+N*16)..end:   N independent ZSTD-compressed attribute streams
+```
+
+`tbo` = `tocByteOffset` from the header. When no extensions are present, `tbo = 32`.
+
+Each TOC entry covers one core stream, in this order, omitting empty ones: positions, alphas, colors, scales, rotations, spherical harmonics (absent when `shDegree` is 0). Each stream's data is exactly one zstd frame, except that the **last** stream's zstd frame may be followed by extension frames (see [Extension frames](#extension-frames)). A stream's `compressedSize` covers all of its bytes; its `uncompressedSize` counts only its own zstd frame.
+
+#### Extension frames
+
+Terms used below:
+- **zstd frame**: one self-contained unit of zstd-compressed data ([RFC 8878 §3.1.1](https://www.rfc-editor.org/rfc/rfc8878#section-3.1.1)).
+- **Skippable frame**: zstd's container for bytes every zstd decoder steps over ([RFC 8878 §3.1.2](https://www.rfc-editor.org/rfc/rfc8878#section-3.1.2)).
+- **Extension frame**: a skippable frame with SPZ's magic whose payload is exactly one zstd frame holding part of an extension's data:
+
+```
+[u32 magic = 0x184D2A53][u32 payloadSize][payload: exactly one zstd frame]
+```
+
+Extension data too large for the plaintext zone is stored in extension frames, appended back to back with no gaps after the zstd frame of the last core stream. The extension record that owns the data lists its extension frames in order, giving each one's byte offset from the start of the last core stream's data (pointing at the magic), its `payloadSize`, and the payload's decompressed size. Joining the decompressed payloads in that order gives the extension's data. zstd decoders skip skippable frames, so decompressing the last stream as a whole yields exactly its core data: readers that don't know an extension load the file unchanged, and never decompress its extension frames.
+
+Writers MUST:
+- keep every payload at most 2^32 - 1 bytes, the range of the u32 `payloadSize`. This is the only size limit: an extension's data may be any size, split across as many extension frames as it needs;
+- record the decompressed size in each payload's zstd frame header (the default when the size is known);
+- never let extension frames overlap.
+
+How much data to put in each extension frame is the writer's choice. zstd's worst-case output is about `n + n/256` bytes, so payloads stay within the limit for any data up to about 3.98 GiB uncompressed. This library uses at most 16 MiB, which compresses within 0.3% of much larger frames while letting large data compress and decompress in parallel. Readers MUST accept any size within the format limit.
+
+Readers that decode an extension frame MUST check, before allocating for it, that:
+- it lies entirely within the last core stream;
+- its magic is `0x184D2A53` and its `payloadSize` matches the record;
+- its payload is exactly one zstd frame, whose header records a decompressed size equal to the record's.
+
+Readers should also check that the extension frame starts after the core stream's own zstd frame (this needs that frame's compressed size, e.g. from `ZSTD_findFrameCompressedSize`), and MAY cap the total decoded extension data; this library drops data beyond 1024 times the file size, the same bound it applies to `numPoints`. An extension whose extension frames fail these checks is dropped; the core data still loads. Readers ignore skippable frames that no record they understand points at.
+
+Every reader, including ones that predate extension frames, still reads their bytes as part of the last core stream, so large extension data delays loading that stream. Consider a separate file for very large payloads.
+
+### Header (version 4)
+
+```c
+struct NgspFileHeader {        // 32 bytes, all fields little-endian
+  uint32_t magic;              // 0x5053474e ("NGSP")
+  uint32_t version;            // 4
+  uint32_t numPoints;
+  uint8_t  shDegree;
+  uint8_t  fractionalBits;
+  uint8_t  flags;
+  uint8_t  numStreams;         // number of ZSTD-compressed attribute streams (typically 6)
+  uint32_t tocByteOffset;     // byte offset from file start to the TOC
+  uint8_t  reserved[12];      // zero, reserved for future use
+};
+```
+
+All values are little-endian.
+
+1. **magic**: Always `0x5053474e` (bytes `N`, `G`, `S`, `P` in file order).
+2. **version**: 4 (current). Versions 1–3 use the legacy gzip format (read-only).
+3. **numPoints**: The number of gaussians.
+4. **shDegree**: The degree of spherical harmonics. Must be between 0 and 4 (inclusive).
+5. **fractionalBits**: The number of bits used for the fractional part of fixed-point coordinates.
+6. **flags**: Bit field.
+   - `0x1`: splat was trained with [antialiasing](https://niujinshuchong.github.io/mip-splatting/).
+   - `0x2`: the header zone contains vendor-specific extension records (see [Extensions](#extensions)).
+7. **numStreams**: Number of ZSTD-compressed attribute streams following the TOC. Typically 6 (positions, alphas, colors, scales, rotations, spherical harmonics).
+8. **tocByteOffset**: Byte offset from the start of the file to the Table of Contents. Everything before `tocByteOffset` is plaintext.
+9. **reserved**: Must be zero.
+
+### Format detection (load path)
+
+```
+bytes[0..3] == "NGSP"  →  version 4 ZSTD format
+bytes[0..1] == 0x1f 0x8b  →  legacy gzip format (versions 1–3, read-only)
+```
+
+### Positions
+
+Positions are represented as `(x, y, z)` coordinates, each as a 24-bit fixed point signed integer.
+The number of fractional bits is determined by the `fractionalBits` field in the header.
+
+### Scales
+
+Scales are represented as `(x, y, z)` components, each represented as an 8-bit log-encoded integer.
+
+### Rotation
+
+In version 3 and 4, rotations are represented as the smallest three components of the normalized rotation quaternion, for optimal rotation accuracy.
+The largest component can be derived from the others and is not stored. Its index is stored on 2 bits
+and each of the smallest three components is encoded as a 10-bit signed integer.
+
+In version 2, rotations are represented as the `(x, y, z)` components of the normalized rotation quaternion. The
+`w` component can be derived from the others and is not stored. Each component is encoded as an
+8-bit signed integer.
+
+### Alphas
+
+Alphas are represented as 8-bit unsigned integers.
+
+### Colors
+
+Colors are stored as `(r, g, b)` values, where each color component is represented as an
+unsigned 8-bit integer.
+
+### Spherical Harmonics
+
+Depending on the degree of spherical harmonics for the splat, this can contain 0 (for degree 0),
+9 (for degree 1), 24 (for degree 2), 45 (for degree 3), or 72 (for degree 4) coefficients per gaussian.
+
+The coefficients for a gaussian are organized such that the color channel is the inner (faster
+varying) axis, and the coefficient is the outer (slower varying) axis, i.e. for degree 1,
+the order of the 9 values is:
+
+```
+sh1n1_r, sh1n1_g, sh1n1_b, sh10_r, sh10_g, sh10_b, sh1p1_r, sh1p1_g, sh1p1_b
+```
+
+Each coefficient is represented as an 8-bit signed integer.
+
+**Quantization:**
+
+SPZ supports configurable spherical harmonics quantization. By default, a fixed-precision quantization is adopted:
+- Assumes SH coefficients are in the [-1, 1] range
+- Fixed 5 bits of precision for degree 1 and 4 bits for degrees 2, 3, and 4
+- Maintained for backward compatibility
+
+The quantization precision can be configured via `PackOptions`:
+- `sh1Bits`: Number of quantization bits for SH degree 1 coefficients (default: 5, range: 1-8)
+- `shRestBits`: Number of quantization bits for SH degree 2+ coefficients (default: 4, range: 1-8)
+
+**Note:** Quantization bits are only used during packing to reduce information entropy for better compression. The unpacking process does not need to know the exact quantization bits, as decompression fills zero bits for quantized data automatically.
+
+This allows users to trade off between file size and quality. The library maintains full backward compatibility with default quantization settings.
+
+### Extensions
+
+SPZ supports vendor-specific extensions (e.g. camera limits) so multiple vendors can coexist in the same file. In version 4, extensions are stored as ILV (type + length + value) records in the plaintext header zone between the fixed header and the TOC — parsers that don't recognize an extension type skip it by length. For the extension format and how to add or use extensions, see [extensions/README.md](extensions/README.md).
+
+### Camera Orbit Limitation
+
+With extension `SPZ_ADOBE_safe_orbit_camera`, SPZ supports storing camera limits which can be used to restrict the view in a render. This extension includes:
+
+**Attributes**
+
+This extension has the following attributes and default values:
+
+```
+  safeOrbitElevationMin := 0.0  // Min elevation for safe orbit (radians)
+  safeOrbitElevationMax := 0.0  // Max elevation for safe orbit (radians)
+  safeOrbitRadiusMin := 0.0     // Min radius for safe orbit
+```
+
+### Georeferencing
+
+With extension `SPZ_NIANTIC_georeference`, SPZ can store a similarity transform (`origin`, unit quaternion `rotation`, uniform `scale`) that maps the asset's RUB positions into a geocentric CRS, named by an `AUTHORITY:CODE` such as `EPSG:4978` (WGS 84 ECEF) or by inline PROJJSON, with an optional coordinate epoch. The library never applies the transform. See [extensions/README.md](extensions/README.md) for the payload layout and validation rules.
