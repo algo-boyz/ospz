@@ -10,6 +10,7 @@ package ospz
 import "core:bytes"
 import "core:compress/deflate"
 import "core:mem"
+import "../ozstd"
 
 // --- Gzip (legacy SPZ) -------------------------------------------------------
 
@@ -42,20 +43,14 @@ zstd_decompress_into :: proc(src, dst: []u8) -> Spz_Error {
 	if len(src) == 0 {
 		return .Decompression_Failed if len(dst) != 0 else .None
 	}
-	// --- wire ozstd here ---------------------------------------------------
-	// Example shapes (pick the one your ozstd exposes):
-	//
-	//   n, err := ozstd.decompress_into(src, dst)
-	//   if err != nil || n != len(dst) { return .Decompression_Failed }
-	//
-	//   out, err := ozstd.decompress(src)
-	//   if err != nil || len(out) != len(dst) { delete(out); return .Decompression_Failed }
-	//   copy(dst, out); delete(out)
-	//
-	// Until wired, fail closed so callers see a clear error instead of silence.
-	_ = src
-	_ = dst
-	return .Decompression_Failed
+	n, err := ozstd.decompress_into(src, dst)
+	if err != nil || n != len(dst) { return .Decompression_Failed }
+
+	out, err := ozstd.decompress(src)
+	if err != nil || len(out) != len(dst) { delete(out); return .Decompression_Failed }
+	copy(dst, out); delete(out)
+
+	return .None
 }
 
 // Convenience: allocate and decompress. Caller owns the result.
