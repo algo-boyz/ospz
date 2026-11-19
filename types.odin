@@ -33,8 +33,8 @@ half_to_float :: proc(h: Half) -> f32 {
 
     if exponent == 0 {
         // Subnormal numbers.
-        return sign_mul * math.pow(2.0, -14.0) *
-            f32(mantissa) / 1024.0
+        return sign_mul * math.pow_f32(2.0, -14.0) *
+            (f32(mantissa) / 1024.0)
     }
 
     if exponent == 31 {
@@ -43,7 +43,7 @@ half_to_float :: proc(h: Half) -> f32 {
             return math.nan_f32()
         }
 
-        return sign_mul * math.inf_f32()
+        return sign_mul * math.inf_f32(1)
     }
 
     // Normal numbers.
@@ -89,7 +89,7 @@ float_to_half :: proc(f: f32) -> Half {
     // Subnormal numbers.
     full_mantissa := 0x800000 | mantissa
     shift         := -(centered_exp + 14)
-    new_mantissa  := full_mantissa >> shift
+    new_mantissa  := full_mantissa >> u32(shift)
 
     return Half((sign << 15) | (new_mantissa >> 13))
 }

@@ -93,19 +93,6 @@ need_rotation :: proc(a, b: Coordinate_System) -> bool {
     return ((a_num >> 3) & 1) != ((b_num >> 3) & 1)
 }
 
-Gaussian_Cloud :: struct {
-    num_points: i32,
-    sh_degree:  i32,
-    antialiased: bool,
-
-    positions: []f32,
-    scales:    []f32,
-    rotations: []f32,
-    alphas:    []f32,
-    colors:    []f32,
-    sh:        []f32,
-}
-
 convert_coordinates :: proc(
     cloud: ^Gaussian_Cloud,
     from, to: Coordinate_System,
@@ -329,7 +316,8 @@ convert_sh_coefficients :: proc(
         flip_sh = c.cross_flip_sh
     }
 
-    for band in 0..<degree {
+    for band_i32 in 0..<degree {
+        band := int(band_i32)
         band_start := band * (band + 2)
         band_size := 2 * band + 3
 
@@ -340,7 +328,8 @@ convert_sh_coefficients :: proc(
         for channel in 0..<3 {
             tmp: [9]f32
 
-            for k in 0..<band_size {
+            for k_i32 in 0..<band_size {
+                k := int(k_i32)
                 tmp[k] = coeffs[(band_start + k) * 3 + channel]
             }
 
@@ -349,9 +338,9 @@ convert_sh_coefficients :: proc(
                     for k in 0..<band_size {
                         tmp[k] *= flip_sh[band_start + k]
                     }
-                    rotate_sh_band_minus_x(band, tmp[:band_size])
+                    rotate_sh_band_minus_x(band_i32, tmp[:band_size])
                 } else {
-                    rotate_sh_band_plus_x(band, tmp[:band_size])
+                    rotate_sh_band_plus_x(band_i32, tmp[:band_size])
                     for k in 0..<band_size {
                         tmp[k] *= flip_sh[band_start + k]
                     }

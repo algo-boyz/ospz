@@ -58,7 +58,10 @@ unquantize_sh :: proc(x: u8) -> f32 {
 
 // Inverse sigmoid (logit).
 inv_sigmoid :: proc(x: f32) -> f32 {
-    return math.log(x / (1.0 - x))
+    return math.log_f32(
+        x / (1.0 - x),
+        f32(math.E),
+    )
 }
 
 
@@ -75,7 +78,7 @@ inv_sigmoid :: proc(x: f32) -> f32 {
 //     flip_q scales xyz during decoding.
 //
 // Cross-family coordinate conversion:
-//     flip_q is identity and rot_flip_q_func transforms the full quaternion.
+//     flip_q is identity and convert_quaternion_xyzw transforms the full quaternion.
 //
 // Quaternion layout: [x, y, z, w]
 unpack_quaternion_first_three :: proc(
@@ -103,9 +106,7 @@ unpack_quaternion_first_three :: proc(
         max(0.0, 1.0 - squared_norm(xyz)),
     )
 
-    if c.rot_flip_q_func != nil {
-        c.rot_flip_q_func(rotation)
-    }
+    convert_quaternion_xyzw(c^, rotation[:])
 }
 
 
@@ -161,9 +162,7 @@ unpack_quaternion_smallest_three :: proc(
     }
 
     // Cross-family coordinate conversion.
-    if c.rot_flip_q_func != nil {
-        c.rot_flip_q_func(rotation)
-    }
+    convert_quaternion_xyzw(c^, rotation[:])
 }
 
 

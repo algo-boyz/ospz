@@ -9,11 +9,6 @@ Splat_Attribute :: enum {
     Sh,
 }
 
-Coordinate_Converter :: struct {
-    flip_q: Vec3f,
-    rot_flip_q_func: proc(rotation: ^[4]f32),
-}
-
 Packed_Gaussians :: struct {
     positions: []u8,
     alphas:    []u8,
