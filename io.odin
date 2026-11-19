@@ -6,7 +6,6 @@ package ospz
 import "core:encoding/endian"
 import "core:mem"
 import "core:os"
-import "core:slice"
 
 FLAG_ANTIALIASED :: u8(0x1)
 FLAG_HAS_EXTENSIONS :: u8(0x2)
@@ -74,8 +73,8 @@ load_spz_packed_from_file :: proc(
 	options: Unpack_Options = {},
 	allocator := context.allocator,
 ) -> (Packed_Gaussians, Spz_Error) {
-	data, ok := os.read_entire_file(path, allocator)
-	if !ok {
+	data, read_err := os.read_entire_file(path, allocator)
+	if read_err != nil {
 		return {}, .Io_Failed
 	}
 	defer delete(data, allocator)
@@ -91,7 +90,6 @@ load_spz_from_bytes :: proc(
 	if err != .None {
 		return {}, err
 	}
-	// packed buffers are owned; unpack copies into cloud then we free packed
 	cloud, uerr := unpack_gaussians(&packed, options, allocator)
 	release_packed_gaussians(&packed, allocator)
 	return cloud, uerr
@@ -102,8 +100,8 @@ load_spz_from_file :: proc(
 	options: Unpack_Options = {},
 	allocator := context.allocator,
 ) -> (Gaussian_Cloud, Spz_Error) {
-	data, ok := os.read_entire_file(path, allocator)
-	if !ok {
+	data, read_err := os.read_entire_file(path, allocator)
+	if read_err != nil {
 		return {}, .Io_Failed
 	}
 	defer delete(data, allocator)
@@ -264,15 +262,12 @@ load_packed_from_ngsp :: proc(
 	result.sh = make([]u8, int(num_points) * int(sh_dim) * 3, allocator)
 
 	dests := make([dynamic][]u8, 0, 6, context.temp_allocator)
-	append_nonempty :: proc(d: ^[dynamic][]u8, buf: []u8) {
-		if len(buf) > 0 do append(d, buf)
-	}
-	append_nonempty(&dests, result.positions)
-	append_nonempty(&dests, result.alphas)
-	append_nonempty(&dests, result.colors)
-	append_nonempty(&dests, result.scales)
-	append_nonempty(&dests, result.rotations)
-	append_nonempty(&dests, result.sh)
+	if len(result.positions) > 0 do append(&dests, result.positions)
+	if len(result.alphas) > 0 do append(&dests, result.alphas)
+	if len(result.colors) > 0 do append(&dests, result.colors)
+	if len(result.scales) > 0 do append(&dests, result.scales)
+	if len(result.rotations) > 0 do append(&dests, result.rotations)
+	if len(result.sh) > 0 do append(&dests, result.sh)
 
 	toc, toc_ok := read_ngsp_toc(data, header)
 	if !toc_ok {
@@ -298,8 +293,7 @@ load_packed_from_ngsp :: proc(
 		}
 		// Last stream may host extension frames after its zstd frame; zstd
 		// decoders stop after one frame, so decompressing the whole span is OK
-		// when ozstd stops at frame end. Prefer feeding only the core frame
-		// once ZSTD_findFrameCompressedSize is available.
+		// when ozstd stops at frame end.
 		src := data[off:end]
 		if e := zstd_decompress_into(src, dests[i]); e != .None {
 			release_packed_gaussians(&result, allocator)
@@ -316,15 +310,14 @@ load_packed_from_ngsp :: proc(
 
 read_ngsp_header :: proc(data: []u8) -> Ngsp_File_Header {
 	h: Ngsp_File_Header
-	// Little-endian field load
-	h.magic = endian.unchecked_get_u32(data[0:], .Little)
-	h.version = endian.unchecked_get_u32(data[4:], .Little)
-	h.num_points = endian.unchecked_get_u32(data[8:], .Little)
+	h.magic = endian.unchecked_get_u32le(data[0:])
+	h.version = endian.unchecked_get_u32le(data[4:])
+	h.num_points = endian.unchecked_get_u32le(data[8:])
 	h.sh_degree = data[12]
 	h.fractional_bits = data[13]
 	h.flags = data[14]
 	h.num_streams = data[15]
-	h.toc_byte_offset = endian.unchecked_get_u32(data[16:], .Little)
+	h.toc_byte_offset = endian.unchecked_get_u32le(data[16:])
 	copy(h.reserved[:], data[20:32])
 	return h
 }
@@ -341,8 +334,8 @@ read_ngsp_toc :: proc(data: []u8, header: Ngsp_File_Header) -> ([]Ngsp_Stream_In
 	compressed_offset := int(toc_end)
 	for i in 0 ..< int(header.num_streams) {
 		e := int(header.toc_byte_offset) + i * TOC_ENTRY_BYTES
-		cs := endian.unchecked_get_u64(data[e:], .Little)
-		us := endian.unchecked_get_u64(data[e + 8:], .Little)
+		cs := endian.unchecked_get_u64le(data[e:])
+		us := endian.unchecked_get_u64le(data[e + 8:])
 		infos[i] = {
 			compressed_size   = cs,
 			uncompressed_size = us,
@@ -374,4 +367,98 @@ num_points_plausible :: proc(num_points: u32, file_size: int) -> bool {
 	}
 	max_points := (u64(file_size) * MAX_COMPRESSION_RATIO) / MIN_BYTES_PER_POINT
 	return u64(num_points) <= max_points
+}
+
+// --- Legacy gzip -------------------------------------------------------------
+
+load_packed_from_gzip :: proc(
+	data: []u8,
+	options: Unpack_Options,
+	allocator: mem.Allocator,
+) -> (Packed_Gaussians, Spz_Error) {
+	_ = options
+	raw, err := gzip_decompress(data, allocator)
+	if err != .None {
+		return {}, err
+	}
+	defer delete(raw, allocator)
+	return deserialize_packed_gaussians(raw, allocator)
+}
+
+deserialize_packed_gaussians :: proc(
+	data: []u8,
+	allocator: mem.Allocator,
+) -> (Packed_Gaussians, Spz_Error) {
+	if len(data) < size_of(Legacy_Packed_Header) {
+		return {}, .Invalid_Header
+	}
+	magic := endian.unchecked_get_u32le(data[0:])
+	version := endian.unchecked_get_u32le(data[4:])
+	num_points_u := endian.unchecked_get_u32le(data[8:])
+	sh_degree := data[12]
+	fractional_bits := data[13]
+	flags := data[14]
+
+	if magic != NGSP_MAGIC {
+		return {}, .Invalid_Header
+	}
+	if version < 1 || version > LATEST_SPZ_HEADER_VERSION {
+		return {}, .Unsupported_Version
+	}
+	if sh_degree > u8(SH_MAX_DEGREE) {
+		return {}, .Invalid_Data
+	}
+	remaining := len(data) - size_of(Legacy_Packed_Header)
+	if num_points_u == 0 ||
+	   num_points_u > u32(max(i32)) ||
+	   (remaining > 0 && int(num_points_u) > remaining / int(MIN_BYTES_PER_POINT)) {
+		return {}, .Invalid_Data
+	}
+
+	num_points := i32(num_points_u)
+	sh_dim := dim_for_degree(i32(sh_degree))
+	uses_f16 := version == 1
+	uses_st := version >= MIN_SMALLEST_THREE_QUATERNIONS_VERSION
+
+	result: Packed_Gaussians
+	result.version = version
+	result.num_points = num_points
+	result.sh_degree = i32(sh_degree)
+	result.fractional_bits = i32(fractional_bits)
+	result.antialiased = (flags & FLAG_ANTIALIASED) != 0
+	result.uses_quaternion_smallest_three = uses_st
+	if (flags & FLAG_HAS_EXTENSIONS) != 0 {
+		result.had_skipped_extensions = true
+	}
+
+	pos_b := 6 if uses_f16 else 9
+	rot_b := 4 if uses_st else 3
+	n := int(num_points)
+
+	need := n * pos_b + n + n * 3 + n * 3 + n * rot_b + n * int(sh_dim) * 3
+	off := size_of(Legacy_Packed_Header)
+	if off + need > len(data) {
+		return {}, .Invalid_Data
+	}
+
+	take :: proc(data: []u8, off: ^int, count: int, allocator: mem.Allocator) -> []u8 {
+		s := data[off^:off^ + count]
+		off^ += count
+		out := make([]u8, count, allocator)
+		copy(out, s)
+		return out
+	}
+
+	result.positions = take(data, &off, n * pos_b, allocator)
+	result.alphas = take(data, &off, n, allocator)
+	result.colors = take(data, &off, n * 3, allocator)
+	result.scales = take(data, &off, n * 3, allocator)
+	result.rotations = take(data, &off, n * rot_b, allocator)
+	result.sh = take(data, &off, n * int(sh_dim) * 3, allocator)
+
+	if !packed_sizes_valid(&result) {
+		release_packed_gaussians(&result, allocator)
+		return {}, .Invalid_Data
+	}
+	return result, .None
 }
