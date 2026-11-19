@@ -93,6 +93,118 @@ need_rotation :: proc(a, b: Coordinate_System) -> bool {
     return ((a_num >> 3) & 1) != ((b_num >> 3) & 1)
 }
 
+
+coordinate_converter :: proc(
+    from, to: Coordinate_System,
+    sh_degree: i32,
+) -> Coordinate_Converter {
+    result := identity_coordinate_converter()
+
+    // Unspecified coordinates mean "do not transform".
+    // Identical coordinates are also an identity conversion.
+    if from == .UNSPECIFIED ||
+       to == .UNSPECIFIED ||
+       from == to {
+        return result
+    }
+
+    // Cross-family conversion:
+    // decompose into a within-family flip and a ±90° X rotation.
+    if need_rotation(from, to) {
+        from_num := i32(from)
+        backward := ((from_num - 1) >> 3) & 1 != 0
+
+        // Move the source coordinate system into the
+        // destination's family. The recursive call now
+        // calculates only the within-family flips.
+        inner_from: Coordinate_System
+
+        if backward {
+            inner_from = Coordinate_System(from_num - 8)
+        } else {
+            inner_from = Coordinate_System(from_num + 8)
+        }
+
+        result = coordinate_converter(
+            inner_from,
+            to,
+            sh_degree,
+        )
+
+        result.cross_family = true
+        result.backward = backward
+
+        // Preserve the recursively calculated flips.
+        // These are consumed by the cross-family transforms.
+        result.cross_flip_p = result.flip_p
+        result.cross_flip_q = result.flip_q
+        result.cross_flip_sh = result.flip_sh
+
+        // Cross-family conversions must not apply the
+        // ordinary flips a second time.
+        result.flip_p = {1, 1, 1}
+        result.flip_q = {1, 1, 1}
+
+        for i in 0..<24 {
+            result.flip_sh[i] = 1
+        }
+
+        return result
+    }
+
+    // Within-family conversion.
+    matches := axes_match(from, to)
+
+    x: f32 = 1
+    y: f32 = 1
+    z: f32 = 1
+
+    if !matches[0] do x = -1
+    if !matches[1] do y = -1
+    if !matches[2] do z = -1
+
+    // Position flips.
+    result.flip_p = {x, y, z}
+
+    // Quaternion vector-component flips.
+    // The scalar component (w) is never flipped.
+    result.flip_q = {
+        y * z,
+        x * z,
+        x * y,
+    }
+
+    // Spherical harmonic coefficient sign flips.
+    result.flip_sh = {
+        y,          //  0
+        z,          //  1
+        x,          //  2
+        x * y,      //  3
+        y * z,      //  4
+        1,          //  5
+        x * z,      //  6
+        1,          //  7
+        y,          //  8
+        x * y * z,  //  9
+        y,          // 10
+        z,          // 11
+        x,          // 12
+        z,          // 13
+        x,          // 14
+        x * y,      // 15
+        y * z,      // 16
+        x * y,      // 17
+        y * z,      // 18
+        1,          // 19
+        x * z,      // 20
+        1,          // 21
+        x * z,      // 22
+        y,          // 23
+    }
+
+    return result
+}
+
 convert_coordinates :: proc(
     cloud: ^Gaussian_Cloud,
     from, to: Coordinate_System,
