@@ -43,14 +43,17 @@ zstd_decompress_into :: proc(src, dst: []u8) -> Spz_Error {
 	if len(src) == 0 {
 		return .Decompression_Failed if len(dst) != 0 else .None
 	}
-	// TODO: func decompress_into does not exist in ozstd check way of working in ozstd/decompress.odin:318 decompress_dctx
-	n, err := ozstd.decompress_into(src, dst)
-	if err != nil || n != len(dst) { return .Decompression_Failed }
 
-	out, err := ozstd.decompress(src)
-	if err != nil || len(out) != len(dst) { delete(out); return .Decompression_Failed }
-	copy(dst, out); delete(out)
-
+	// Zeroed DCtx is valid; no allocation needed for a single-shot decode.
+	dctx: ozstd.DCtx
+	written, err := ozstd.decompress_dctx(
+		&dctx,
+		raw_data(dst), len(dst),
+		raw_data(src), len(src),
+	)
+	if err != .None || written != len(dst) {
+		return .Decompression_Failed
+	}
 	return .None
 }
 
