@@ -1,0 +1,431 @@
+From: ospz port <ospz@local>
+Date: Fri, 20 Nov 2026 23:59:00 +0100
+Subject: [PATCH] save_spz v4 (header+TOC+ZSTD streams) + round-trip test
+
+Implement the missing SPZ v4 save path:
+
+  pack_gaussians → core attribute streams → sequential ZSTD compress
+  → NgspFileHeader + TOC + compressed frames → []u8 / file
+
+Public API:
+  save_spz_to_bytes(cloud, Pack_Options) → ([]u8, Spz_Error)
+  save_spz_to_file(cloud, Pack_Options, path) → Spz_Error
+
+No extension ILVs / frames yet (empty extension zone, FLAG_HAS_EXTENSIONS
+clear). Legacy gzip save (version < 4) is not implemented in this patch.
+
+Also adds tests/save_roundtrip_test.odin: pack → save → load → unpack
+and compare attributes within quantization tolerances.
+---
+ compress.odin                    |  36 +++++++
+ io.odin                          | 198 +++++++++++++++++++++++++++++++++++++++
+ tests/save_roundtrip_test.odin   | 156 +++++++++++++++++++++++++++++++
+ 3 files changed, 390 insertions(+)
+ create mode 100644 tests/save_roundtrip_test.odin
+
+diff --git a/compress.odin b/compress.odin
+index a7498de..b1c2d3e 100644
+--- a/compress.odin
++++ b/compress.odin
+@@ -72,4 +72,40 @@ zstd_decompress :: proc(
+ 		delete(dst, allocator)
+ 		return nil, e
+ 	}
+ 	return dst, .None
+ }
++
++// --- ZSTD compress (SPZ v4 attribute streams) --------------------------------
++
++// Default compression level for SPZ attribute streams. ozstd supports 3, 6, 22;
++// level 3 matches typical upstream ZSTD defaults for interactive save latency.
++DEFAULT_ZSTD_LEVEL :: 3
++
++// Compress src into a newly allocated buffer. Caller owns the result.
++// Uses ozstd one-shot compress (levels 3 / 6 / 22 only).
++zstd_compress :: proc(
++	src: []u8,
++	level: int = DEFAULT_ZSTD_LEVEL,
++	allocator := context.allocator,
++) -> (dst: []u8, err: Spz_Error) {
++	if len(src) == 0 {
++		// Empty stream: still emit a valid (empty) ZSTD frame so TOC sizes match.
++		bound := ozstd.compress_bound(0)
++		buf := make([]u8, bound, allocator)
++		written, cerr := ozstd.compress(raw_data(buf), len(buf), raw_data(src), 0, level)
++		if cerr != .None {
++			delete(buf, allocator)
++			return nil, .Compression_Failed
++		}
++		return buf[:written], .None
++	}
++	bound := ozstd.compress_bound(len(src))
++	buf := make([]u8, bound, allocator)
++	written, cerr := ozstd.compress(raw_data(buf), len(buf), raw_data(src), len(src), level)
++	if cerr != .None {
++		delete(buf, allocator)
++		return nil, .Compression_Failed
++	}
++	return buf[:written], .None
++}
+diff --git a/io.odin b/io.odin
+index 10e68aa..c9d0e1f 100644
+--- a/io.odin
++++ b/io.odin
+@@ -108,6 +108,204 @@ load_spz_from_file :: proc(
+ 	return load_spz_from_bytes(data, options, allocator)
+ }
+ 
++// --- Public save API ---------------------------------------------------------
++
++// Pack a Gaussian_Cloud and serialize it as SPZ v4 (NGSP + ZSTD streams).
++// Caller owns the returned byte slice. On error the slice is nil.
++// Extensions are not written yet (empty extension zone).
++save_spz_to_bytes :: proc(
++	g: ^Gaussian_Cloud,
++	options: Pack_Options = {},
++	allocator := context.allocator,
++) -> (out: []u8, err: Spz_Error) {
++	opts := options
++	if opts.version == 0 {
++		opts.version = LATEST_SPZ_HEADER_VERSION
++	}
++	if opts.sh1_bits == 0 {
++		opts.sh1_bits = DEFAULT_SH1_BITS
++	}
++	if opts.sh_rest_bits == 0 {
++		opts.sh_rest_bits = DEFAULT_SH_REST_BITS
++	}
++
++	if opts.version < MIN_ZSTD_SPZ_HEADER_VERSION {
++		// Legacy gzip path not ported in this change set.
++		return nil, .Unsupported_Version
++	}
++	if opts.version > LATEST_SPZ_HEADER_VERSION {
++		return nil, .Unsupported_Version
++	}
++
++	packed := pack_gaussians(g, opts)
++	if g.num_points > 0 && packed.num_points == 0 {
++		return nil, .Invalid_Data
++	}
++	defer release_packed_gaussians(&packed, allocator)
++
++	return save_packed_to_ngsp(&packed, opts.version, allocator)
++}
++
++save_spz_to_file :: proc(
++	g: ^Gaussian_Cloud,
++	options: Pack_Options = {},
++	path: string,
++	allocator := context.allocator,
++) -> Spz_Error {
++	data, err := save_spz_to_bytes(g, options, allocator)
++	if err != .None {
++		return err
++	}
++	defer delete(data, allocator)
++	if !os.write_entire_file(path, data) {
++		return .Io_Failed
++	}
++	return .None
++}
++
++// Serialize already-packed attribute streams as NGSP v4.
++// extension zone is empty; FLAG_HAS_EXTENSIONS is clear.
++save_packed_to_ngsp :: proc(
++	packed: ^Packed_Gaussians,
++	version: u32,
++	allocator := context.allocator,
++) -> (out: []u8, err: Spz_Error) {
++	if packed == nil || !packed_sizes_valid(packed) {
++		return nil, .Invalid_Data
++	}
++
++	// Core streams in the order loaders expect (skip empty SH at degree 0).
++	srcs := core_streams(packed)
++	if len(srcs) == 0 && packed.num_points > 0 {
++		return nil, .Invalid_Data
++	}
++
++	// Compress each stream sequentially (parallel batch can land later).
++	compressed := make([dynamic][]u8, 0, len(srcs), context.temp_allocator)
++	for src in srcs {
++		chunk, cerr := zstd_compress(src, DEFAULT_ZSTD_LEVEL, context.temp_allocator)
++		if cerr != .None {
++			return nil, cerr
++		}
++		append(&compressed, chunk)
++	}
++
++	return write_ngsp(packed, version, {}, compressed[:], srcs, 0, allocator)
++}
++
++// Non-empty core attribute buffers, load order: positions, alphas, colors,
++// scales, rotations, sh.
++core_streams :: proc(packed: ^Packed_Gaussians) -> [][]u8 {
++	attrs := [6]Splat_Attribute{
++		.Positions, .Alphas, .Colors, .Scales, .Rotations, .Sh,
++	}
++	out: [dynamic][]u8
++	out.allocator = context.temp_allocator
++	for attr in attrs {
++		buf := packed_buffer(packed, attr)
++		if len(buf) > 0 {
++			append(&out, buf)
++		}
++	}
++	return out[:]
++}
++
++// Assemble [header][extension zone][TOC][compressed streams].
++// host_extra_bytes is added to the last TOC compressedSize (extension frames);
++// pass 0 when no frames are appended.
++write_ngsp :: proc(
++	packed: ^Packed_Gaussians,
++	version: u32,
++	extension_zone: []u8,
++	compressed: [][]u8,
++	uncompressed: [][]u8,
++	host_extra_bytes: u64,
++	allocator := context.allocator,
++) -> (out: []u8, err: Spz_Error) {
++	if len(compressed) != len(uncompressed) {
++		return nil, .Invalid_Data
++	}
++	num_streams := len(compressed)
++	if num_streams > 255 {
++		return nil, .Invalid_Data
++	}
++
++	toc_byte_offset := u64(size_of(Ngsp_File_Header)) + u64(len(extension_zone))
++	if toc_byte_offset > u64(max(u32)) {
++		return nil, .Invalid_Data
++	}
++
++	total := toc_byte_offset + u64(num_streams)*TOC_ENTRY_BYTES + host_extra_bytes
++	for chunk in compressed {
++		total += u64(len(chunk))
++	}
++	if total > u64(max(int)) {
++		return nil, .Allocation_Failed
++	}
++
++	buf := make([]u8, int(total), allocator)
++	// Header
++	header: Ngsp_File_Header
++	header.magic = NGSP_MAGIC
++	header.version = version
++	header.num_points = u32(packed.num_points)
++	header.sh_degree = u8(packed.sh_degree)
++	header.fractional_bits = u8(packed.fractional_bits)
++	flags: u8 = 0
++	if packed.antialiased {
++		flags |= FLAG_ANTIALIASED
++	}
++	if len(extension_zone) > 0 {
++		flags |= FLAG_HAS_EXTENSIONS
++	}
++	header.flags = flags
++	header.num_streams = u8(num_streams)
++	header.toc_byte_offset = u32(toc_byte_offset)
++
++	endian.unchecked_put_u32le(buf[0:], header.magic)
++	endian.unchecked_put_u32le(buf[4:], header.version)
++	endian.unchecked_put_u32le(buf[8:], header.num_points)
++	buf[12] = header.sh_degree
++	buf[13] = header.fractional_bits
++	buf[14] = header.flags
++	buf[15] = header.num_streams
++	endian.unchecked_put_u32le(buf[16:], header.toc_byte_offset)
++	// reserved[12] already zero from make
++
++	if len(extension_zone) > 0 {
++		copy(buf[size_of(Ngsp_File_Header):], extension_zone)
++	}
++
++	// TOC
++	for i in 0 ..< num_streams {
++		cs := u64(len(compressed[i]))
++		if i + 1 == num_streams {
++			cs += host_extra_bytes
++		}
++		us := u64(len(uncompressed[i]))
++		e := int(toc_byte_offset) + i * TOC_ENTRY_BYTES
++		endian.unchecked_put_u64le(buf[e:], cs)
++		endian.unchecked_put_u64le(buf[e + 8:], us)
++	}
++
++	// Compressed payloads
++	off := int(toc_byte_offset) + num_streams * TOC_ENTRY_BYTES
++	for chunk in compressed {
++		copy(buf[off:], chunk)
++		off += len(chunk)
++	}
++	// host_extra_bytes region (extension frames) left as zeros / filled by caller
++	return buf, .None
++}
++
+ // Bulk decode Packed_Gaussians -> Gaussian_Cloud (coord convert RUB -> options.to).
+ unpack_gaussians :: proc(
+ 	p: ^Packed_Gaussians,
+diff --git a/tests/save_roundtrip_test.odin b/tests/save_roundtrip_test.odin
+new file mode 100644
+index 0000000..a1b2c3d
+--- /dev/null
++++ b/tests/save_roundtrip_test.odin
+@@ -0,0 +1,156 @@
++package testospz
++
++import "core:math"
++import "core:testing"
++import spz "../"
++
++@(test)
++test_save_load_roundtrip_v4 :: proc(t: ^testing.T) {
++	for degree in 0 ..= 3 {
++		cloud := pack_test_make_cloud(i32(degree))
++		defer pack_test_delete_cloud(&cloud)
++
++		opts := spz.pack_options_default()
++		opts.from = .UNSPECIFIED
++		opts.version = spz.LATEST_SPZ_HEADER_VERSION
++
++		bytes, serr := spz.save_spz_to_bytes(&cloud, opts)
++		testing.expect_value(t, serr, spz.Spz_Error.None)
++		if serr != .None {
++			return
++		}
++		defer delete(bytes)
++
++		// NGSP magic
++		testing.expect(t, len(bytes) >= 32)
++		testing.expect(t, bytes[0] == 'N' && bytes[1] == 'G' && bytes[2] == 'S' && bytes[3] == 'P')
++
++		uopts := spz.unpack_options_default()
++		uopts.to = .UNSPECIFIED
++		loaded, lerr := spz.load_spz_from_bytes(bytes, uopts)
++		testing.expect_value(t, lerr, spz.Spz_Error.None)
++		if lerr != .None {
++			return
++		}
++		defer spz.release_gaussian_cloud(&loaded)
++
++		testing.expect_value(t, loaded.num_points, cloud.num_points)
++		testing.expect_value(t, loaded.sh_degree, cloud.sh_degree)
++		testing.expect_value(t, loaded.antialiased, cloud.antialiased)
++
++		// Positions: 24-bit fixed @ 12 fractional bits → ~1/4096 step
++		for i in 0 ..< 3 {
++			testing.expect(t, pack_test_close(loaded.positions[i], cloud.positions[i], 0.0003))
++		}
++		// Scales in sixteenths
++		for i in 0 ..< 3 {
++			testing.expect(t, pack_test_close(loaded.scales[i], cloud.scales[i], 0.03126))
++		}
++		// Colors
++		for i in 0 ..< 3 {
++			testing.expect(t, pack_test_close(loaded.colors[i], cloud.colors[i], 0.014))
++		}
++		// Alpha (logit space after inv_sigmoid)
++		testing.expect(t, pack_test_close(loaded.alphas[0], cloud.alphas[0], 0.02))
++		// Quaternion: q and -q are equivalent
++		q_src := spz.normalized_quat({
++			cloud.rotations[0], cloud.rotations[1], cloud.rotations[2], cloud.rotations[3],
++		})
++		q_dst := [4]f32{
++			loaded.rotations[0], loaded.rotations[1], loaded.rotations[2], loaded.rotations[3],
++		}
++		testing.expect(t, pack_test_quaternion_similarity(q_src, q_dst) > 0.999)
++
++		sh_dim := int(spz.dim_for_degree(i32(degree)))
++		for coeff in 0 ..< sh_dim {
++			for channel in 0 ..< 3 {
++				src := cloud.sh[coeff * 3 + channel]
++				act := loaded.sh[coeff * 3 + channel]
++				tol: f32 = 0.065
++				if coeff < 3 do tol = 0.035
++				testing.expect(t, pack_test_close(act, src, tol))
++			}
++		}
++	}
++}
++
++@(test)
++test_save_empty_cloud :: proc(t: ^testing.T) {
++	cloud := spz.Gaussian_Cloud{
++		num_points = 0,
++		sh_degree  = 0,
++	}
++	opts := spz.pack_options_default()
++	bytes, err := spz.save_spz_to_bytes(&cloud, opts)
++	// Zero points: pack returns empty streams; save should still succeed with
++	// a valid header (num_streams may be 0) or return Invalid_Data depending
++	// on policy. Accept either a successful empty-ish file or a clean error.
++	if err == .None {
++		defer delete(bytes)
++		testing.expect(t, len(bytes) >= 32)
++		testing.expect(t, bytes[0] == 'N')
++	} else {
++		testing.expect(t, err == .Invalid_Data || err == .None)
++	}
++}
++
++@(test)
++test_save_header_fields :: proc(t: ^testing.T) {
++	cloud := pack_test_make_cloud(2)
++	defer pack_test_delete_cloud(&cloud)
++	cloud.antialiased = true
++
++	opts := spz.pack_options_default()
++	opts.version = 4
++	bytes, err := spz.save_spz_to_bytes(&cloud, opts)
++	testing.expect_value(t, err, spz.Spz_Error.None)
++	if err != .None do return
++	defer delete(bytes)
++
++	// magic
++	magic := u32(bytes[0]) | (u32(bytes[1]) << 8) | (u32(bytes[2]) << 16) | (u32(bytes[3]) << 24)
++	testing.expect_value(t, magic, spz.NGSP_MAGIC)
++	// version
++	version := u32(bytes[4]) | (u32(bytes[5]) << 8) | (u32(bytes[6]) << 16) | (u32(bytes[7]) << 24)
++	testing.expect_value(t, version, u32(4))
++	// num_points
++	np := u32(bytes[8]) | (u32(bytes[9]) << 8) | (u32(bytes[10]) << 16) | (u32(bytes[11]) << 24)
++	testing.expect_value(t, np, u32(1))
++	// sh_degree, fractional_bits, flags
++	testing.expect_value(t, bytes[12], u8(2))
++	testing.expect_value(t, bytes[13], u8(12)) // PACKED_FRACTIONAL_BITS
++	testing.expect(t, (bytes[14] & 0x1) != 0)  // FLAG_ANTIALIASED
++	testing.expect(t, (bytes[14] & 0x2) == 0)  // no extensions
++	// num_streams: positions, alphas, colors, scales, rotations, sh (degree 2 → non-empty)
++	testing.expect_value(t, bytes[15], u8(6))
++}
++
++@(test)
++test_save_load_packed_only :: proc(t: ^testing.T) {
++	cloud := pack_test_make_cloud(1)
++	defer pack_test_delete_cloud(&cloud)
++
++	opts := spz.pack_options_default()
++	bytes, serr := spz.save_spz_to_bytes(&cloud, opts)
++	testing.expect_value(t, serr, spz.Spz_Error.None)
++	if serr != .None do return
++	defer delete(bytes)
++
++	packed, perr := spz.load_spz_packed_from_bytes(bytes)
++	testing.expect_value(t, perr, spz.Spz_Error.None)
++	if perr != .None do return
++	defer spz.release_packed_gaussians(&packed)
++
++	testing.expect_value(t, packed.num_points, i32(1))
++	testing.expect_value(t, packed.sh_degree, i32(1))
++	testing.expect(t, packed.uses_quaternion_smallest_three)
++	testing.expect(t, spz.packed_sizes_valid(&packed))
++	testing.expect_value(t, len(packed.positions), 9)
++	testing.expect_value(t, len(packed.alphas), 1)
++	testing.expect_value(t, len(packed.colors), 3)
++	testing.expect_value(t, len(packed.scales), 3)
++	testing.expect_value(t, len(packed.rotations), 4)
++	// degree 1 → 3 coeffs × 3 channels
++	testing.expect_value(t, len(packed.sh), 9)
++}

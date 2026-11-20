@@ -73,3 +73,26 @@ zstd_decompress :: proc(
 	}
 	return dst, .None
 }
+
+// --- ZSTD compress (SPZ v4 attribute streams) --------------------------------
+
+// Default compression level for SPZ attribute streams. ozstd supports 3, 6, 22;
+// level 3 matches typical upstream ZSTD defaults for interactive save latency.
+DEFAULT_ZSTD_LEVEL :: 3
+
+// Compress src into a newly allocated buffer. Caller owns the result.
+// Uses ozstd one-shot compress (levels 3 / 6 / 22 only).
+zstd_compress :: proc(
+	src: []u8,
+	level: int = DEFAULT_ZSTD_LEVEL,
+	allocator := context.allocator,
+) -> (dst: []u8, err: Spz_Error) {
+	bound := ozstd.compress_bound(len(src))
+	buf := make([]u8, bound, allocator)
+	written, cerr := ozstd.compress(raw_data(buf), len(buf), raw_data(src), len(src), level)
+	if cerr != .None {
+		delete(buf, allocator)
+		return nil, .Compression_Failed
+	}
+	return buf[:written], .None
+}
