@@ -21,7 +21,7 @@ import "core:math"
 import "core:os"
 import "core:slice"
 
-import ospz "../"
+import ospz ".."
 import rl "vendor:raylib"
 import rlgl "vendor:raylib/rlgl"
 
