@@ -230,16 +230,12 @@ save_packed_to_ngsp :: proc(
 	}
 
 	// Compress each stream sequentially (parallel batch can land later).
-	compressed := make([dynamic][]u8, 0, len(srcs), context.temp_allocator)
-	for src in srcs {
-		chunk, cerr := zstd_compress(src, DEFAULT_ZSTD_LEVEL, context.temp_allocator)
-		if cerr != .None {
-			return nil, cerr
-		}
-		append(&compressed, chunk)
+	compressed, cerr := zstd_compress_all(srcs, DEFAULT_ZSTD_LEVEL, context.temp_allocator)
+	if cerr != .None {
+		return nil, cerr
 	}
 
-	return write_ngsp(packed, version, {}, compressed[:], srcs, 0, allocator)
+	return write_ngsp(packed, version, {}, compressed, srcs, 0, allocator)
 }
 
 // Non-empty core attribute buffers, load order: positions, alphas, colors,
@@ -524,6 +520,7 @@ load_packed_from_ngsp :: proc(
 		return {}, .Invalid_Data
 	}
 
+	tasks := make([]Decompress_Task, len(dests), context.temp_allocator)
 	for i in 0 ..< len(dests) {
 		info := toc[i]
 		if int(info.uncompressed_size) != len(dests[i]) {
@@ -536,13 +533,16 @@ load_packed_from_ngsp :: proc(
 			release_packed_gaussians(&result, allocator)
 			return {}, .Invalid_Data
 		}
-		// Last stream may host extension frames after its zstd frame; zstd
-		// decoders stop after one frame, so decompressing the whole span is OK
-		// when ozstd stops at frame end.
-		src := data[off:end]
-		if e := zstd_decompress_into(src, dests[i]); e != .None {
+		// Last stream may host skippable extension frames after its zstd frame;
+		// ozstd steps over them so the whole TOC span is safe to pass.
+		tasks[i] = {src = data[off:end], dst = dests[i]}
+	}
+
+	succeeded := zstd_decompress_all(tasks)
+	for ok in succeeded {
+		if !ok {
 			release_packed_gaussians(&result, allocator)
-			return {}, e
+			return {}, .Decompression_Failed
 		}
 	}
 
