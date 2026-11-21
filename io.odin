@@ -480,17 +480,9 @@ load_packed_from_ngsp :: proc(
 	result.uses_quaternion_smallest_three = uses_st
 
 	if has_extension_zone(header, len(data)) {
-		zone := data[size_of(Ngsp_File_Header):header.toc_byte_offset]
-		_, had_any, zone_ok := skip_extension_ilv_zone(zone)
-		if !zone_ok {
-			// Malformed extension zone: still attempt core load (robustness),
-			// but mark that extensions were present and not fully trusted.
-			result.had_skipped_extensions = true
-		} else if had_any {
-			// MVP: known types are not decoded yet; mark skipped so callers
-			// know coordinate-system / georef / custom attrs were ignored.
-			result.had_skipped_extensions = true
-		}
+		exts, had_unknown, _ := parse_extension_zone(data, header.toc_byte_offset, allocator)
+		result.extensions = exts
+		result.had_skipped_extensions = had_unknown
 	}
 
 	// Pre-size attribute buffers (order must match save / TOC streams).
