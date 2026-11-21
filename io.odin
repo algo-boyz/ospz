@@ -46,6 +46,55 @@ Ngsp_Stream_Info :: struct {
 	compressed_offset: int,
 }
 
+// Known extension type IDs (vendor << 16 | extension). Unknown types are skipped.
+// See https://github.com/nianticlabs/spz/blob/main/extensions/README.md
+Spz_Extension_Type :: enum u32 {
+	ADOBE_Safe_Orbit_Camera  = 0xADBE0002,
+	ADOBE_Coordinate_System  = 0xADBE0003,
+	NIANTIC_Georeference     = 0x4E530001,
+	NIANTIC_Custom_Attribute = 0x4E530002,
+}
+
+// One length-delimited extension record in the plaintext zone:
+// [ u32 type ][ u32 byteLength ][ payload... ]
+Extension_Record :: struct {
+	type:        u32,
+	byte_length: u32,
+	payload:     []u8, // view into the file buffer; not owned
+}
+
+// Walk the ILV extension zone between the 32-byte header and the TOC.
+// Unknown types are skipped; the zone must be an exact sequence of records
+// (no trailing junk). Returns ok=false if the structure is invalid.
+// Core Gaussian data still loads when ok=true and had_any is true (MVP:
+// we do not parse known payloads yet — callers see had_skipped_extensions).
+skip_extension_ilv_zone :: proc(zone: []u8) -> (records: []Extension_Record, had_any: bool, ok: bool) {
+	if len(zone) == 0 {
+		return nil, false, true
+	}
+	list: [dynamic]Extension_Record
+	list.allocator = context.temp_allocator
+	off := 0
+	for off < len(zone) {
+		if off + 8 > len(zone) {
+			return nil, false, false
+		}
+		typ := endian.unchecked_get_u32le(zone[off:])
+		blen := endian.unchecked_get_u32le(zone[off + 4:])
+		off += 8
+		if u64(blen) > u64(len(zone) - off) {
+			return nil, false, false
+		}
+		payload := zone[off:off + int(blen)]
+		off += int(blen)
+		append(&list, Extension_Record{type = typ, byte_length = blen, payload = payload})
+	}
+	if off != len(zone) {
+		return nil, false, false
+	}
+	return list[:], len(list) > 0, true
+}
+
 // --- Public API --------------------------------------------------------------
 
 load_spz_packed_from_bytes :: proc(
@@ -435,8 +484,17 @@ load_packed_from_ngsp :: proc(
 	result.uses_quaternion_smallest_three = uses_st
 
 	if has_extension_zone(header, len(data)) {
-		// Skip ILVs for now; core streams still load.
-		result.had_skipped_extensions = true
+		zone := data[size_of(Ngsp_File_Header):header.toc_byte_offset]
+		_, had_any, zone_ok := skip_extension_ilv_zone(zone)
+		if !zone_ok {
+			// Malformed extension zone: still attempt core load (robustness),
+			// but mark that extensions were present and not fully trusted.
+			result.had_skipped_extensions = true
+		} else if had_any {
+			// MVP: known types are not decoded yet; mark skipped so callers
+			// know coordinate-system / georef / custom attrs were ignored.
+			result.had_skipped_extensions = true
+		}
 	}
 
 	// Pre-size attribute buffers (order must match save / TOC streams).
