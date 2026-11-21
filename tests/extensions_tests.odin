@@ -83,8 +83,11 @@ test_extension_georeference_roundtrip :: proc(t: ^testing.T) {
 	spz.write_extension_ilv(&buf, src)
 	defer delete(buf)
 
+	data := make_zone_with_header(buf[:])
+	defer delete(data)
+
 	exts, had_unknown, err := spz.parse_extension_zone(
-		make_zone_with_header(buf[:]),
+		data,
 		u32(32 + len(buf)),
 	)
 	testing.expect_value(t, err, spz.Spz_Error.None)
@@ -103,7 +106,6 @@ test_extension_georeference_roundtrip :: proc(t: ^testing.T) {
 		testing.expect(t, math.abs(got.origin[i] - src.origin[i]) < 1e-12)
 	}
 }
-
 @(test)
 test_extension_unknown_skipped :: proc(t: ^testing.T) {
 	// Unknown type 0xDEAD0001, 4-byte payload
