@@ -33,7 +33,6 @@ Packed_Gaussians :: struct {
     uses_quaternion_smallest_three: bool,
     had_skipped_extensions: bool,
 	extensions:             []Extension,
-
     positions: []u8,
     scales:    []u8,
     rotations: []u8,
