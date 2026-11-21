@@ -18,11 +18,13 @@ test_extension_safe_orbit_roundtrip :: proc(t: ^testing.T) {
 	defer delete(buf)
 
 	// Fake a minimal zone: type+len already written by write_extension_ilv
-	exts, had_unknown, err := spz.parse_extension_zone(
-		// pad 32-byte header so zone starts at offset 32
-		make_zone_with_header(buf[:]),
-		u32(32 + len(buf)),
-	)
+	data := make_zone_with_header(buf[:])
+    defer delete(data)
+
+    exts, had_unknown, err := spz.parse_extension_zone(
+        data,
+        u32(32 + len(buf)),
+    )
 	testing.expect_value(t, err, spz.Spz_Error.None)
 	testing.expect(t, !had_unknown)
 	testing.expect_value(t, len(exts), 1)
@@ -43,10 +45,13 @@ test_extension_coordinate_system_roundtrip :: proc(t: ^testing.T) {
 	spz.write_extension_ilv(&buf, src)
 	defer delete(buf)
 
-	exts, had_unknown, err := spz.parse_extension_zone(
-		make_zone_with_header(buf[:]),
-		u32(32 + len(buf)),
-	)
+	data := make_zone_with_header(buf[:])
+    defer delete(data)
+
+    exts, had_unknown, err := spz.parse_extension_zone(
+        data,
+        u32(32 + len(buf)),
+    )
 	testing.expect_value(t, err, spz.Spz_Error.None)
 	testing.expect(t, !had_unknown)
 	testing.expect_value(t, len(exts), 1)
@@ -112,10 +117,13 @@ test_extension_unknown_skipped :: proc(t: ^testing.T) {
 	known := spz.Extension_Coordinate_System{system = .RUF}
 	spz.write_extension_ilv(&zone_payload, known)
 
-	exts, had_unknown, err := spz.parse_extension_zone(
-		make_zone_with_header(zone_payload[:]),
-		u32(32 + len(zone_payload)),
-	)
+	data := make_zone_with_header(zone_payload[:])
+    defer delete(data)
+
+    exts, had_unknown, err := spz.parse_extension_zone(
+        data,
+        u32(32 + len(zone_payload)),
+    )
 	testing.expect_value(t, err, spz.Spz_Error.None)
 	testing.expect(t, had_unknown)
 	testing.expect_value(t, len(exts), 1) // only the known one
