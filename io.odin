@@ -213,7 +213,7 @@ save_spz_to_file :: proc(
 }
 
 // Serialize already-packed attribute streams as NGSP v4.
-// extension zone is empty; FLAG_HAS_EXTENSIONS is clear.
+// Emits any extensions on packed.extensions into the plaintext zone.
 save_packed_to_ngsp :: proc(
 	packed: ^Packed_Gaussians,
 	version: u32,
@@ -229,13 +229,20 @@ save_packed_to_ngsp :: proc(
 		return nil, .Invalid_Data
 	}
 
+	// Build extension ILV zone (empty when packed.extensions is nil/empty).
+	ext_buf: [dynamic]u8
+	ext_buf.allocator = context.temp_allocator
+	for e in packed.extensions {
+		write_extension_ilv(&ext_buf, e)
+	}
+
 	// Compress each stream sequentially (parallel batch can land later).
 	compressed, cerr := zstd_compress_all(srcs, DEFAULT_ZSTD_LEVEL, context.temp_allocator)
 	if cerr != .None {
 		return nil, cerr
 	}
 
-	return write_ngsp(packed, version, {}, compressed, srcs, 0, allocator)
+	return write_ngsp(packed, version, ext_buf[:], compressed, srcs, 0, allocator)
 }
 
 // Non-empty core attribute buffers, load order: positions, alphas, colors,
@@ -415,7 +422,9 @@ unpack_gaussians :: proc(
 	}
 
 	// Storage is RUB; convert to caller's system.
-	convert_coordinates(&result, .RUB, options.to)
+	storage_cs := get_packed_coordinate_system(p.extensions)
+	convert_coordinates(&result, storage_cs, options.to)
+
 	return result, .None
 }
 
@@ -427,7 +436,8 @@ release_packed_gaussians :: proc(p: ^Packed_Gaussians, allocator := context.allo
 	delete(p.alphas, allocator)
 	delete(p.colors, allocator)
 	delete(p.sh, allocator)
-	p^ = {}
+	release_extensions(p.extensions, allocator)
+    p^ = {}
 }
 
 release_gaussian_cloud :: proc(g: ^Gaussian_Cloud, allocator := context.allocator) {
