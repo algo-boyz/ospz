@@ -1,5 +1,15 @@
 # OSPZ
 
+<p align="center">
+  <video src="viewer/demo.mp4" controls width="960">
+    Your browser does not support video.
+  </video>
+</p>
+
+<p align="center">
+  <sub>Demo scene courtesy of <a href="https://superspl.at/scene/eb53f02f">SuperSplat</a>.</sub>
+</p>
+
 `.spz` is a file format for compressed 3D gaussian splats. This directory contains a Odin library
 for saving and loading data in the .spz format.
 
