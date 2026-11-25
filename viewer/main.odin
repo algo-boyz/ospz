@@ -20,6 +20,7 @@ package main
 
 import "core:fmt"
 import "core:math"
+import "core:math/linalg"
 import "core:os"
 import "core:slice"
 
@@ -40,15 +41,13 @@ Splat_View :: struct {
 	order_tex: rl.Texture2D,
 	order_px:  []u8,
 	pos:       [][3]f32,
-	order:     []int,
-	xforms:    []rl.Matrix,
+	order:     []u32,
+	depth:     []f32,
+	visible:   int,
 	data_w:    i32,
 	data_h:    i32,
 	order_h:   i32,
 }
-
-g_cam: [3]f32
-g_pos: [][3]f32
 
 main :: proc() {
 	rl.SetConfigFlags({.WINDOW_RESIZABLE, .MSAA_4X_HINT, .VSYNC_HINT})
@@ -91,6 +90,9 @@ main :: proc() {
 
 	camera: rl.Camera3D
 	frame_camera(&camera, view)
+	
+	last_fwd: [3]f32
+	last_pos: [3]f32
 
 	for !rl.WindowShouldClose() {
 		if rl.IsFileDropped() {
@@ -103,6 +105,7 @@ main :: proc() {
 					view = next
 					load_err = .None
 					frame_camera(&camera, view)
+					last_fwd = {}
 				} else {
 					load_err = e
 					fmt.eprintf("load %s: %v\n", p, e)
@@ -113,12 +116,14 @@ main :: proc() {
 
 		if rl.IsKeyPressed(.R) {
 			frame_camera(&camera, view)
+			last_fwd = {}
 		}
-		rl.UpdateCamera(&camera, .ORBITAL)
+		update_orbit(&camera)
 
-		fwd := linalg.normalize(camera.target - camera.position) // import "core:math/linalg"
-		if view.count > 0 && (linalg.dot(fwd, last_fwd) < 0.9995 ||
-		linalg.length(camera.position - last_pos) > 0.01*view.extent) {
+		fwd := linalg.normalize(camera.target - camera.position)
+		if view.count > 0 &&
+		   (linalg.dot(fwd, last_fwd) < 0.9995 ||
+			linalg.vector_length(camera.position - last_pos) > 0.01 * view.extent) {
 			sort_order(&view, camera.position, fwd)
 			rl.UpdateTexture(view.order_tex, raw_data(view.order_px))
 			last_fwd, last_pos = fwd, camera.position
@@ -315,11 +320,10 @@ load_view :: proc(path: string) -> (view: Splat_View, err: ospz.Spz_Error) {
 	rl.SetTextureFilter(view.data_tex, .POINT)
 	rl.SetTextureWrap(view.data_tex, .CLAMP)
 
-	view.order = make([]int, kept)
-	for i in 0 ..< kept do view.order[i] = i
-	view.xforms = make([]rl.Matrix, kept)
-	ident := rl.Matrix(1)
-	for i in 0 ..< kept do view.xforms[i] = ident
+	view.order = make([]u32, kept)
+	for i in 0 ..< kept do view.order[i] = u32(i)
+	view.depth = make([]f32, kept)
+	view.visible = kept
 
 	view.order_h = i32((kept + ORDER_W - 1) / ORDER_W)
 	view.order_px = make([]u8, ORDER_W*int(view.order_h)*4)
@@ -350,7 +354,7 @@ release_view :: proc(v: ^Splat_View) {
 	delete(v.pos)
 	delete(v.order)
 	delete(v.order_px)
-	delete(v.xforms)
+	delete(v.depth)
 	if len(v.name) > 0 do delete(v.name)
 	v^ = {}
 }
@@ -367,48 +371,82 @@ frame_camera :: proc(camera: ^rl.Camera3D, v: Splat_View) {
 	}
 }
 
-sort_order :: proc(v: ^Splat_View, cam, fwd: [3]f32) {
-	BUCKETS :: 1 << 16
-	NEAR :: f32(0.01)
-	counts: [BUCKETS]u32 // zero-initialised
+update_orbit :: proc(c: ^rl.Camera3D) {
+	d := c.position - c.target
+	dist := linalg.vector_length(d)
+	yaw := math.atan2(d.x, d.z)
+	pitch := math.asin(clamp(d.y / dist, -1, 1))
 
-	lo, hi := max(f32), -max(f32)
-	for p, i in v.pos {
-		d := (p.x-cam.x)*fwd.x + (p.y-cam.y)*fwd.y + (p.z-cam.z)*fwd.z
-		v.depth[i] = d
-		if d > NEAR { lo = min(lo, d); hi = max(hi, d) }
+	if rl.IsMouseButtonDown(.LEFT) {
+		m := rl.GetMouseDelta()
+		yaw -= m.x * 0.005
+		pitch = clamp(pitch + m.y * 0.005, -1.5, 1.5)
 	}
-	if hi <= lo { v.visible = 0; return }
-	scale := f32(BUCKETS-1) / (hi - lo)
+	dist = max(dist * (1 - rl.GetMouseWheelMove() * 0.1), 0.01)
 
-	bucket :: proc(d, lo, scale: f32) -> int {
-		// far splats get low buckets, so they are drawn first (back-to-front)
-		return (BUCKETS-1) - min(int((d-lo)*scale), BUCKETS-1)
-	}
-	for d in v.depth do if d > NEAR { counts[bucket(d, lo, scale)] += 1 }
-
-	sum: u32
-	for i in 0 ..< BUCKETS { c := counts[i]; counts[i] = sum; sum += c }
-
-	for d, i in v.depth do if d > NEAR {
-		b := bucket(d, lo, scale)
-		v.order[counts[b]] = u32(i)
-		counts[b] += 1
-	}
-	v.visible = int(sum)
-	for k in 0 ..< v.visible {
-		id := v.order[k]
-		px := v.order_px[k*4:]
-		px[0] = u8(id); px[1] = u8(id >> 8); px[2] = u8(id >> 16); px[3] = 255
+	c.position = c.target + dist * [3]f32{
+		math.cos(pitch) * math.sin(yaw),
+		math.sin(pitch),
+		math.cos(pitch) * math.cos(yaw),
 	}
 }
 
-farther :: proc(a, b: int) -> bool {
-	pa := g_pos[a]
-	pb := g_pos[b]
-	da := (pa.x-g_cam.x)*(pa.x-g_cam.x) + (pa.y-g_cam.y)*(pa.y-g_cam.y) + (pa.z-g_cam.z)*(pa.z-g_cam.z)
-	db := (pb.x-g_cam.x)*(pb.x-g_cam.x) + (pb.y-g_cam.y)*(pb.y-g_cam.y) + (pb.z-g_cam.z)*(pb.z-g_cam.z)
-	return da > db
+SORT_BUCKETS :: 1 << 16
+SORT_NEAR :: f32(0.01)
+
+sort_bucket :: proc(d, lo, scale: f32) -> int {
+	// far splats land in low buckets, so they are drawn first (back-to-front)
+	return (SORT_BUCKETS - 1) - min(int((d - lo) * scale), SORT_BUCKETS - 1)
+}
+
+sort_order :: proc(v: ^Splat_View, cam, fwd: [3]f32) {
+	counts: [SORT_BUCKETS]u32 // zero-initialised
+
+	lo, hi := max(f32), -max(f32)
+	for p, i in v.pos {
+		d := (p.x - cam.x) * fwd.x + (p.y - cam.y) * fwd.y + (p.z - cam.z) * fwd.z
+		v.depth[i] = d
+		if d > SORT_NEAR {
+			lo = min(lo, d)
+			hi = max(hi, d)
+		}
+	}
+	if hi <= lo {
+		v.visible = 0
+		return
+	}
+	scale := f32(SORT_BUCKETS - 1) / (hi - lo)
+
+	for d in v.depth {
+		if d > SORT_NEAR {
+			counts[sort_bucket(d, lo, scale)] += 1
+		}
+	}
+
+	sum: u32
+	for i in 0 ..< SORT_BUCKETS {
+		c := counts[i]
+		counts[i] = sum
+		sum += c
+	}
+
+	for d, i in v.depth {
+		if d > SORT_NEAR {
+			b := sort_bucket(d, lo, scale)
+			v.order[counts[b]] = u32(i)
+			counts[b] += 1
+		}
+	}
+
+	v.visible = int(sum)
+	for k in 0 ..< v.visible {
+		id := v.order[k]
+		px := v.order_px[k * 4:]
+		px[0] = u8(id)
+		px[1] = u8(id >> 8)
+		px[2] = u8(id >> 16)
+		px[3] = 255
+	}
 }
 
 make_quad :: proc() -> rl.Mesh {
