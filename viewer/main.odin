@@ -1,6 +1,6 @@
 package main
 
-// Little SPZ viewer.
+// Little SPZ / PLY splat viewer.
 //
 //   odin/
 //     ospz/
@@ -9,7 +9,9 @@ package main
 //   cd ospz-viewer
 //   odin run . -- ../ospz/models/boat.spz
 //
-// Drag a .spz onto the window to swap models.
+// Opens .spz and 3DGS .ply (binary little-endian, float properties) files; the
+// format is detected from the file contents.
+// Drag a .spz or .ply onto the window to swap models.
 // Left-drag orbits, wheel zooms, R frames the model again.
 //
 // Splats are camera-projected 3D Gaussians (scale + quaternion), blended
@@ -54,7 +56,7 @@ main :: proc() {
 	defer rl.CloseWindow()
 	rl.SetTargetFPS(60)
 
-	path := "boat.spz"
+	path := "tree.ply"
 	if len(os.args) > 1 {
 		path = os.args[1]
 	}
@@ -63,7 +65,6 @@ main :: proc() {
 	defer release_view(&view)
 
 	shader := rl.LoadShaderFromMemory(VS, FS)
-	defer rl.UnloadShader(shader)
 	if shader.id == 0 {
 		fmt.eprintln("shader failed to compile")
 		return
@@ -156,7 +157,7 @@ main :: proc() {
 		if load_err != .None {
 			rl.DrawText(fmt.ctprintf("load failed: %v", load_err), 16, 40, 18, {230, 90, 80, 255})
 		} else {
-			rl.DrawText(fmt.ctprintf("%d splats   drag orbit   wheel zoom   R reset   drop a .spz", view.count), 16, 40, 18, {180, 174, 164, 255})
+			rl.DrawText(fmt.ctprintf("%d splats   drag orbit   wheel zoom   R reset   drop a .spz or .ply", view.count), 16, 40, 18, {180, 174, 164, 255})
 		}
 		rl.DrawFPS(16, 68)
 		rl.EndDrawing()
@@ -173,8 +174,35 @@ bind_sampler :: proc(shader_id: u32, loc: i32, tex: u32, slot: i32) {
 	rlgl.SetUniform(loc, &slot_val, i32(rl.ShaderUniformDataType.INT), 1)
 }
 
+// Loads a splat cloud from either an .spz or a 3DGS .ply file. The format is
+// detected from the file contents rather than the extension, so renamed or
+// extension-less files still work. Both paths hand back a cloud in the same
+// coordinate frame (SPZ's native RUB) so the rest of the viewer treats them
+// identically.
+load_cloud :: proc(path: string) -> (cloud: ospz.Gaussian_Cloud, err: ospz.Spz_Error) {
+	data, read_err := os.read_entire_file(path, context.allocator)
+	if read_err != nil {
+		return {}, .Io_Failed
+	}
+	defer delete(data)
+
+	if is_ply(data) {
+		// 3DGS PLY exports are RDF. Convert to RUB, matching what SPZ decodes to
+		// (and what the CLI uses for PLY -> SPZ). Leaving this UNSPECIFIED would
+		// skip the conversion and show PLY models rotated 180 degrees about X.
+		return ospz.load_splat_from_ply_bytes(data, {to = .RUB})
+	}
+	// NGSP (v4) and legacy gzip are told apart inside the SPZ loader, which also
+	// reports Invalid_Header for anything it doesn't recognise.
+	return ospz.load_spz_from_bytes(data, ospz.unpack_options_default())
+}
+
+is_ply :: proc(data: []u8) -> bool {
+	return len(data) >= 3 && data[0] == 'p' && data[1] == 'l' && data[2] == 'y'
+}
+
 load_view :: proc(path: string) -> (view: Splat_View, err: ospz.Spz_Error) {
-	cloud, e := ospz.load_spz_from_file(path, ospz.unpack_options_default())
+	cloud, e := load_cloud(path)
 	if e != .None {
 		return {}, e
 	}
@@ -204,10 +232,21 @@ load_view :: proc(path: string) -> (view: Splat_View, err: ospz.Spz_Error) {
 		sy := math.exp(clamp(cloud.scales[i*3+1], -12, 8))
 		sz := math.exp(clamp(cloud.scales[i*3+2], -12, 8))
 
-        qx :=  cloud.rotations[i*4+0]
-        qy := -cloud.rotations[i*4+1]   // conjugate for the Y flip
-        qz :=  cloud.rotations[i*4+2]
-        qw := -cloud.rotations[i*4+3]
+        // Raw 3DGS PLY quaternions are not unit length (SPZ decodes to unit
+        // quaternions already); the shader's quat_mat needs them normalised.
+        qx := cloud.rotations[i*4+0]
+        qy := cloud.rotations[i*4+1]
+        qz := cloud.rotations[i*4+2]
+        qw := cloud.rotations[i*4+3]
+        qn := math.sqrt(qx*qx + qy*qy + qz*qz + qw*qw)
+        if is_finite(qn) && qn > 1e-8 {
+            inv := 1 / qn
+            qx *= inv; qy *= inv; qz *= inv; qw *= inv
+        } else {
+            qx, qy, qz, qw = 0, 0, 0, 1
+        }
+        qy = -qy   // conjugate for the Y flip
+        qw = -qw
 
 		cr := clamp(0.5+SH_C0*cloud.colors[i*3+0], 0, 1)
 		cg := clamp(0.5+SH_C0*cloud.colors[i*3+1], 0, 1)
@@ -340,24 +379,20 @@ farther :: proc(a, b: int) -> bool {
 }
 
 make_quad :: proc() -> rl.Mesh {
-	verts := make([]f32, 12)
-	uvs := make([]f32, 8)
-	indices := make([]u16, 6)
-	copy(verts, []f32{
-		-1, -1, 0,
-		1, -1, 0,
-		1, 1, 0,
-		-1, 1, 0,
-	})
-	copy(uvs, []f32{0, 0, 1, 0, 1, 1, 0, 1})
-	copy(indices, []u16{0, 1, 2, 0, 2, 3})
+	verts   := ([^]f32)(rl.MemAlloc(12 * size_of(f32)))
+	uvs     := ([^]f32)(rl.MemAlloc(8  * size_of(f32)))
+	indices := ([^]u16)(rl.MemAlloc(6  * size_of(u16)))
+
+	copy(verts[:12],  []f32{-1,-1,0,  1,-1,0,  1,1,0,  -1,1,0})
+	copy(uvs[:8],     []f32{0,0, 1,0, 1,1, 0,1})
+	copy(indices[:6], []u16{0,1,2, 0,2,3})
 
 	mesh: rl.Mesh
-	mesh.vertexCount = 4
+	mesh.vertexCount   = 4
 	mesh.triangleCount = 2
-	mesh.vertices = raw_data(verts)
-	mesh.texcoords = raw_data(uvs)
-	mesh.indices = raw_data(indices)
+	mesh.vertices      = verts
+	mesh.texcoords     = uvs
+	mesh.indices       = indices
 	rl.UploadMesh(&mesh, false)
 	return mesh
 }
