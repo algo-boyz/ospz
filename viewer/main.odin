@@ -116,9 +116,12 @@ main :: proc() {
 		}
 		rl.UpdateCamera(&camera, .ORBITAL)
 
-		if view.count > 0 {
-			sort_order(&view, camera.position)
+		fwd := linalg.normalize(camera.target - camera.position) // import "core:math/linalg"
+		if view.count > 0 && (linalg.dot(fwd, last_fwd) < 0.9995 ||
+		linalg.length(camera.position - last_pos) > 0.01*view.extent) {
+			sort_order(&view, camera.position, fwd)
 			rl.UpdateTexture(view.order_tex, raw_data(view.order_px))
+			last_fwd, last_pos = fwd, camera.position
 		}
 
 		rl.BeginDrawing()
@@ -144,7 +147,14 @@ main :: proc() {
 			rlgl.DisableBackfaceCulling()
             rlgl.SetBlendMode(i32(rl.BlendMode.CUSTOM))
             rlgl.SetBlendFactors(1, 0x0303, 0x8006) // ONE, ONE_MINUS_SRC_ALPHA, FUNC_ADD
-            rl.DrawMeshInstanced(quad, mat, raw_data(view.xforms), i32(view.count))
+            // rl.DrawMeshInstanced(quad, mat, raw_data(view.xforms), i32(view.count))
+			rlgl.EnableShader(shader.id)
+			bind_sampler(shader.id, loc_data,  view.data_tex.id,  1)
+			bind_sampler(shader.id, loc_order, view.order_tex.id, 2)
+			rlgl.EnableVertexArray(quad.vaoId)
+			rlgl.DrawVertexArrayElementsInstanced(0, 6, nil, i32(view.visible))
+			rlgl.DisableVertexArray()
+			rlgl.DisableShader()
             rlgl.SetBlendMode(i32(rl.BlendMode.ALPHA))
 			rlgl.EnableDepthTest()
 			rlgl.EnableDepthMask()
@@ -357,16 +367,39 @@ frame_camera :: proc(camera: ^rl.Camera3D, v: Splat_View) {
 	}
 }
 
-sort_order :: proc(v: ^Splat_View, cam: [3]f32) {
-	g_cam = cam
-	g_pos = v.pos
-	slice.sort_by(v.order, farther)
-	for i in 0 ..< v.count {
-		id := u32(v.order[i])
-		v.order_px[i*4+0] = u8(id)
-		v.order_px[i*4+1] = u8(id >> 8)
-		v.order_px[i*4+2] = u8(id >> 16)
-		v.order_px[i*4+3] = 255
+sort_order :: proc(v: ^Splat_View, cam, fwd: [3]f32) {
+	BUCKETS :: 1 << 16
+	NEAR :: f32(0.01)
+	counts: [BUCKETS]u32 // zero-initialised
+
+	lo, hi := max(f32), -max(f32)
+	for p, i in v.pos {
+		d := (p.x-cam.x)*fwd.x + (p.y-cam.y)*fwd.y + (p.z-cam.z)*fwd.z
+		v.depth[i] = d
+		if d > NEAR { lo = min(lo, d); hi = max(hi, d) }
+	}
+	if hi <= lo { v.visible = 0; return }
+	scale := f32(BUCKETS-1) / (hi - lo)
+
+	bucket :: proc(d, lo, scale: f32) -> int {
+		// far splats get low buckets, so they are drawn first (back-to-front)
+		return (BUCKETS-1) - min(int((d-lo)*scale), BUCKETS-1)
+	}
+	for d in v.depth do if d > NEAR { counts[bucket(d, lo, scale)] += 1 }
+
+	sum: u32
+	for i in 0 ..< BUCKETS { c := counts[i]; counts[i] = sum; sum += c }
+
+	for d, i in v.depth do if d > NEAR {
+		b := bucket(d, lo, scale)
+		v.order[counts[b]] = u32(i)
+		counts[b] += 1
+	}
+	v.visible = int(sum)
+	for k in 0 ..< v.visible {
+		id := v.order[k]
+		px := v.order_px[k*4:]
+		px[0] = u8(id); px[1] = u8(id >> 8); px[2] = u8(id >> 16); px[3] = 255
 	}
 }
 
