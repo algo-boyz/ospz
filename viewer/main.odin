@@ -50,7 +50,7 @@ Splat_View :: struct {
 }
 
 main :: proc() {
-	rl.SetConfigFlags({.WINDOW_RESIZABLE, .MSAA_4X_HINT, .VSYNC_HINT})
+	rl.SetConfigFlags({.WINDOW_RESIZABLE, .VSYNC_HINT})
 	rl.InitWindow(1280, 720, "ospz")
 	defer rl.CloseWindow()
 	rl.SetTargetFPS(60)
@@ -124,7 +124,7 @@ main :: proc() {
 		if view.count > 0 &&
 		   (linalg.dot(fwd, last_fwd) < 0.9995 ||
 			linalg.vector_length(camera.position - last_pos) > 0.01 * view.extent) {
-			sort_order(&view, camera.position, fwd)
+			sort_order(&view, camera.position, fwd, max(view.extent*40, 100))
 			rl.UpdateTexture(view.order_tex, raw_data(view.order_px))
 			last_fwd, last_pos = fwd, camera.position
 		}
@@ -300,9 +300,7 @@ load_view :: proc(path: string) -> (view: Splat_View, err: ospz.Spz_Error) {
 
 	view.count = kept
 	view.pos = pos[:kept]
-	view.center = (min_p + max_p) * 0.5
-	ext := max_p - min_p
-	view.extent = max(ext.x, max(ext.y, ext.z))
+	view.center, view.extent = robust_bounds(view.pos, 0.02, 0.98)
 	if view.extent < 1e-4 do view.extent = 1
 	view.name = fmt.aprintf("%s", path)
 
@@ -371,6 +369,26 @@ frame_camera :: proc(camera: ^rl.Camera3D, v: Splat_View) {
 	}
 }
 
+// Center/size from the 2nd–98th percentile of a subsample, so stray splats don't blow up the framing.
+robust_bounds :: proc(pos: [][3]f32, lo_q, hi_q: f32) -> (center: [3]f32, extent: f32) {
+	STEP :: 8
+	m := (len(pos) + STEP - 1) / STEP
+	tmp := make([]f32, m)
+	defer delete(tmp)
+
+	lo, hi: [3]f32
+	for axis in 0 ..< 3 {
+		for i in 0 ..< m do tmp[i] = pos[i * STEP][axis]
+		slice.sort(tmp)
+		lo[axis] = tmp[int(f32(m - 1) * lo_q)]
+		hi[axis] = tmp[int(f32(m - 1) * hi_q)]
+	}
+	center = (lo + hi) * 0.5
+	e := hi - lo
+	extent = max(e.x, max(e.y, e.z))
+	return
+}
+
 update_orbit :: proc(c: ^rl.Camera3D) {
 	d := c.position - c.target
 	dist := linalg.vector_length(d)
@@ -399,14 +417,14 @@ sort_bucket :: proc(d, lo, scale: f32) -> int {
 	return (SORT_BUCKETS - 1) - min(int((d - lo) * scale), SORT_BUCKETS - 1)
 }
 
-sort_order :: proc(v: ^Splat_View, cam, fwd: [3]f32) {
+sort_order :: proc(v: ^Splat_View, cam, fwd: [3]f32, far: f32) {
 	counts: [SORT_BUCKETS]u32 // zero-initialised
 
 	lo, hi := max(f32), -max(f32)
 	for p, i in v.pos {
 		d := (p.x - cam.x) * fwd.x + (p.y - cam.y) * fwd.y + (p.z - cam.z) * fwd.z
 		v.depth[i] = d
-		if d > SORT_NEAR {
+		if d > SORT_NEAR && d < far {
 			lo = min(lo, d)
 			hi = max(hi, d)
 		}
@@ -418,7 +436,7 @@ sort_order :: proc(v: ^Splat_View, cam, fwd: [3]f32) {
 	scale := f32(SORT_BUCKETS - 1) / (hi - lo)
 
 	for d in v.depth {
-		if d > SORT_NEAR {
+		if d > SORT_NEAR && d < far {
 			counts[sort_bucket(d, lo, scale)] += 1
 		}
 	}
@@ -431,7 +449,7 @@ sort_order :: proc(v: ^Splat_View, cam, fwd: [3]f32) {
 	}
 
 	for d, i in v.depth {
-		if d > SORT_NEAR {
+		if d > SORT_NEAR && d < far {
 			b := sort_bucket(d, lo, scale)
 			v.order[counts[b]] = u32(i)
 			counts[b] += 1
